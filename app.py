@@ -17,9 +17,12 @@ META_TOKEN = st.secrets.get("META_ACCESS_TOKEN", "")
 META_AD_ACCOUNT = st.secrets.get("META_AD_ACCOUNT_ID", "")
 META_BASE = "https://graph.facebook.com/v19.0"
 
+GA4_PROPERTY_ID = st.secrets.get("GA4_PROPERTY_ID", "")
+GA4_SA_JSON = st.secrets.get("GA4_SERVICE_ACCOUNT_JSON", "")
+
 st.set_page_config(
     page_title="MAS Dashboard",
-    page_icon="🐠",
+    page_icon="ð ",
     layout="wide",
     initial_sidebar_state="collapsed"
 )
@@ -121,13 +124,10 @@ def fetch_shop_info():
 
 @st.cache_data(ttl=900)
 def fetch_meta_ads(days=30):
-    """Fetch Meta Ads insights for the given period."""
     if not META_TOKEN or not META_AD_ACCOUNT:
         return None, None
-
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     until = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     url = f"{META_BASE}/{META_AD_ACCOUNT}/insights"
     params = {
         "fields": "spend,impressions,clicks,cpc,cpm,reach,actions",
@@ -138,9 +138,7 @@ def fetch_meta_ads(days=30):
     data = r.json()
     if "error" in data or not data.get("data"):
         return None, None
-
     summary = data["data"][0] if data["data"] else {}
-
     camp_url = f"{META_BASE}/{META_AD_ACCOUNT}/campaigns"
     camp_params = {
         "fields": "name,status,insights.time_range(" + json.dumps({"since": since, "until": until}) + "){spend,impressions,clicks,cpc}",
@@ -149,7 +147,6 @@ def fetch_meta_ads(days=30):
     }
     cr = requests.get(camp_url, params=camp_params, timeout=30)
     camps_data = cr.json().get("data", [])
-
     campaigns = []
     for c in camps_data:
         ins = c.get("insights", {}).get("data", [{}])
@@ -163,17 +160,14 @@ def fetch_meta_ads(days=30):
                 "clicks": int(i.get("clicks", 0)),
                 "cpc": float(i.get("cpc", 0)),
             })
-
     return summary, campaigns
 
 @st.cache_data(ttl=900)
 def fetch_meta_daily(days=30):
     if not META_TOKEN or not META_AD_ACCOUNT:
         return None
-
     since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%d")
     until = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     url = f"{META_BASE}/{META_AD_ACCOUNT}/insights"
     params = {
         "fields": "spend,impressions,clicks",
@@ -185,7 +179,6 @@ def fetch_meta_daily(days=30):
     data = r.json().get("data", [])
     if not data:
         return None
-
     rows = []
     for d in data:
         rows.append({
@@ -195,6 +188,100 @@ def fetch_meta_daily(days=30):
             "clicks": int(d.get("clicks", 0)),
         })
     return pd.DataFrame(rows)
+
+@st.cache_data(ttl=900)
+def fetch_ga4(days=30):
+    if not GA4_PROPERTY_ID or not GA4_SA_JSON:
+        return None
+    try:
+        from google.oauth2 import service_account
+        from google.analytics.data_v1beta import BetaAnalyticsDataClient
+        from google.analytics.data_v1beta.types import (
+            RunReportRequest, DateRange, Metric, Dimension
+        )
+        sa_info = json.loads(GA4_SA_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            sa_info,
+            scopes=["https://www.googleapis.com/auth/analytics.readonly"]
+        )
+        client = BetaAnalyticsDataClient(credentials=creds)
+        prop = f"properties/{GA4_PROPERTY_ID}"
+        date_range = [DateRange(start_date=f"{days}daysAgo", end_date="today")]
+
+        # ââ Summary metrics ââ
+        summary_req = RunReportRequest(
+            property=prop,
+            date_ranges=date_range,
+            metrics=[
+                Metric(name="sessions"),
+                Metric(name="activeUsers"),
+                Metric(name="screenPageViews"),
+                Metric(name="bounceRate"),
+                Metric(name="averageSessionDuration"),
+                Metric(name="newUsers"),
+            ],
+        )
+        sr = client.run_report(summary_req)
+        summary = {}
+        if sr.rows:
+            vals = sr.rows[0].metric_values
+            keys = ["sessions", "users", "pageviews", "bounce_rate", "avg_duration", "new_users"]
+            for k, v in zip(keys, vals):
+                summary[k] = float(v.value)
+
+        # ââ Traffic channels ââ
+        ch_req = RunReportRequest(
+            property=prop,
+            date_ranges=date_range,
+            dimensions=[Dimension(name="sessionDefaultChannelGroup")],
+            metrics=[Metric(name="sessions"), Metric(name="activeUsers")],
+        )
+        ch_r = client.run_report(ch_req)
+        channels = []
+        for row in ch_r.rows:
+            channels.append({
+                "channel": row.dimension_values[0].value,
+                "sessions": int(row.metric_values[0].value),
+                "users": int(row.metric_values[1].value),
+            })
+
+        # ââ Daily sessions ââ
+        daily_req = RunReportRequest(
+            property=prop,
+            date_ranges=date_range,
+            dimensions=[Dimension(name="date")],
+            metrics=[Metric(name="sessions"), Metric(name="activeUsers")],
+            order_bys=[],
+        )
+        dr = client.run_report(daily_req)
+        daily_rows = []
+        for row in dr.rows:
+            daily_rows.append({
+                "date": pd.to_datetime(row.dimension_values[0].value, format="%Y%m%d").date(),
+                "sessions": int(row.metric_values[0].value),
+                "users": int(row.metric_values[1].value),
+            })
+        daily_df = pd.DataFrame(daily_rows).sort_values("date") if daily_rows else pd.DataFrame()
+
+        # ââ Top pages ââ
+        page_req = RunReportRequest(
+            property=prop,
+            date_ranges=date_range,
+            dimensions=[Dimension(name="pagePath")],
+            metrics=[Metric(name="screenPageViews"), Metric(name="activeUsers")],
+        )
+        pr = client.run_report(page_req)
+        pages = []
+        for row in pr.rows[:15]:
+            pages.append({
+                "page": row.dimension_values[0].value,
+                "views": int(row.metric_values[0].value),
+                "users": int(row.metric_values[1].value),
+            })
+
+        return {"summary": summary, "channels": channels, "daily": daily_df, "pages": pages}
+    except Exception as e:
+        return {"error": str(e)}
 
 # -- MAIN --
 if not STORE or not TOKEN:
@@ -214,13 +301,15 @@ with st.spinner("Loading data..."):
         shop = fetch_shop_info()
         meta_summary, meta_campaigns = fetch_meta_ads(days)
         meta_daily = fetch_meta_daily(days)
+        ga4_data = fetch_ga4(days)
     except Exception as e:
         st.error(f"Failed to load data: {e}")
         st.stop()
 
 df = pd.DataFrame(raw_orders) if raw_orders else pd.DataFrame()
-st.title(f"MAS — {shop['name']} Dashboard")
-st.caption(f"Currency: {shop['currencyCode']} · Last {days} days · {len(df)} orders · refreshes every 15 min")
+
+st.title(f"MAS â {shop['name']} Dashboard")
+st.caption(f"Currency: {shop['currencyCode']} Â· Last {days} days Â· {len(df)} orders Â· refreshes every 15 min")
 
 if df.empty:
     st.info("No orders found for this period.")
@@ -233,11 +322,14 @@ df_cur = df[df["created_at"] >= cutoff]
 df_prev = df[(df["created_at"] >= prev_cutoff) & (df["created_at"] < cutoff)]
 
 def delta_pct(cur, prev):
-    if prev == 0: return None
+    if prev == 0:
+        return None
     return (cur - prev) / prev * 100
 
 def fmt_delta(pct):
-    if pct is None: return ""
+    if pct is None:
+        return ""
+    arrow = "up" if pct >= 0 else "down"
     sign = "+" if pct >= 0 else ""
     cls = "delta-up" if pct >= 0 else "delta-down"
     return f'<span class="{cls}">{sign}{pct:.1f}%</span>'
@@ -252,18 +344,27 @@ discounts_cur = df_cur["discounts"].sum()
 discounts_prev = df_prev["discounts"].sum()
 cur = df_cur["currency"].iloc[0] if not df_cur.empty else "AUD"
 
-st.markdown("### 🛒 Shopify Sales")
+# ââ SHOPIFY KPI CARDS ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Shopify Sales")
 k1, k2, k3, k4 = st.columns(4)
 
 def kpi_card(col, label, value, pct):
-    col.markdown(f'<div class="card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-delta">{fmt_delta(pct)}</div></div>', unsafe_allow_html=True)
+    col.markdown(f"""
+    <div class="card">
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+        <div class="metric-delta">{fmt_delta(pct)}</div>
+    </div>
+    """, unsafe_allow_html=True)
 
 kpi_card(k1, "Revenue", f"{cur} {revenue_cur:,.2f}", delta_pct(revenue_cur, revenue_prev))
 kpi_card(k2, "Orders", f"{orders_cur:,}", delta_pct(orders_cur, orders_prev))
 kpi_card(k3, "Avg Order Value", f"{cur} {aov_cur:,.2f}", delta_pct(aov_cur, aov_prev))
 kpi_card(k4, "Discounts Given", f"{cur} {discounts_cur:,.2f}", delta_pct(discounts_cur, discounts_prev))
 
-st.markdown("### 📘 Meta Ads Performance")
+# ââ META ADS SECTION âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Meta Ads Performance")
+
 if meta_summary:
     ad_spend = float(meta_summary.get("spend", 0))
     ad_impressions = int(meta_summary.get("impressions", 0))
@@ -271,13 +372,20 @@ if meta_summary:
     ad_cpc = float(meta_summary.get("cpc", 0))
     ad_cpm = float(meta_summary.get("cpm", 0))
     ad_reach = int(meta_summary.get("reach", 0))
+
     roas = revenue_cur / ad_spend if ad_spend > 0 else 0
     cac = ad_spend / orders_cur if orders_cur > 0 else 0
     ctr = (ad_clicks / ad_impressions * 100) if ad_impressions > 0 else 0
 
     m1, m2, m3, m4, m5, m6 = st.columns(6)
     def meta_card(col, label, value, sub=""):
-        col.markdown(f'<div class="card" style="border-left:4px solid #1877f2"><div class="metric-label">{label}</div><div class="metric-value" style="font-size:1.5rem">{value}</div><div class="metric-delta" style="color:#888">{sub}</div></div>', unsafe_allow_html=True)
+        col.markdown(f"""
+        <div class="card" style="border-left: 4px solid #1877f2;">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value" style="font-size:1.5rem;">{value}</div>
+            <div class="metric-delta" style="color:#888;">{sub}</div>
+        </div>
+        """, unsafe_allow_html=True)
 
     meta_card(m1, "Ad Spend", f"${ad_spend:,.0f}", f"{days}d total")
     meta_card(m2, "ROAS", f"{roas:.2f}x", "Revenue / Spend")
@@ -287,63 +395,201 @@ if meta_summary:
     meta_card(m6, "CTR", f"{ctr:.2f}%", f"{ad_reach:,} reach")
 
     if meta_daily is not None and not meta_daily.empty:
-        df_cur2 = df_cur.copy()
-        df_cur2["date"] = df_cur2["created_at"].dt.date
-        daily_rev2 = df_cur2.groupby("date")["total"].sum().reset_index()
+        df_cur_daily = df_cur.copy()
+        df_cur_daily["date"] = df_cur_daily["created_at"].dt.date
+        daily_rev = df_cur_daily.groupby("date")["total"].sum().reset_index()
+
         fig = go.Figure()
-        fig.add_trace(go.Bar(x=meta_daily["date"], y=meta_daily["spend"], name="Ad Spend ($)", marker_color="#1877f2", opacity=0.8))
-        fig.add_trace(go.Scatter(x=daily_rev2["date"], y=daily_rev2["total"], name=f"Revenue ({cur})", yaxis="y2", line=dict(color="#22c55e", width=2), mode="lines+markers"))
-        fig.update_layout(title="Daily Ad Spend vs Revenue", yaxis=dict(title="Ad Spend (USD)"), yaxis2=dict(title=f"Revenue ({cur})", overlaying="y", side="right"), legend=dict(orientation="h", y=1.1), height=300, margin=dict(t=50, b=20))
+        fig.add_trace(go.Bar(
+            x=meta_daily["date"], y=meta_daily["spend"],
+            name="Ad Spend ($)", marker_color="#1877f2", opacity=0.8
+        ))
+        fig.add_trace(go.Scatter(
+            x=daily_rev["date"], y=daily_rev["total"],
+            name=f"Revenue ({cur})", yaxis="y2",
+            line=dict(color="#22c55e", width=2), mode="lines+markers"
+        ))
+        fig.update_layout(
+            title="Daily Ad Spend vs Revenue",
+            yaxis=dict(title="Ad Spend (USD)"),
+            yaxis2=dict(title=f"Revenue ({cur})", overlaying="y", side="right"),
+            legend=dict(orientation="h", y=1.1),
+            height=300, margin=dict(t=50, b=20),
+        )
         st.plotly_chart(fig, use_container_width=True)
 
     if meta_campaigns:
+        st.markdown("**Campaign Breakdown**")
         camp_df = pd.DataFrame(meta_campaigns).sort_values("spend", ascending=False)
         camp_df = camp_df[camp_df["spend"] > 0]
         if not camp_df.empty:
-            fig = px.bar(camp_df, x="spend", y="campaign", orientation="h", color="cpc", color_continuous_scale="Blues", labels={"spend": "Spend (USD)", "campaign": "", "cpc": "CPC"}, title="Spend by Campaign", hover_data=["impressions", "clicks", "cpc"])
-            fig.update_layout(height=max(200, len(camp_df)*45+60), margin=dict(t=40, b=20))
+            fig = px.bar(
+                camp_df, x="spend", y="campaign", orientation="h",
+                color="cpc", color_continuous_scale="Blues",
+                labels={"spend": "Spend (USD)", "campaign": "", "cpc": "CPC"},
+                title="Spend by Campaign",
+                hover_data=["impressions", "clicks", "cpc"],
+            )
+            fig.update_layout(height=max(200, len(camp_df) * 45 + 60), margin=dict(t=40, b=20))
             st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("Meta Ads data unavailable. Check META_ACCESS_TOKEN and META_AD_ACCOUNT_ID in secrets.")
 
-st.markdown("### 📈 Trends")
+# ââ GOOGLE ANALYTICS 4 SECTION ââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Google Analytics 4")
+
+if ga4_data and "error" not in ga4_data:
+    s = ga4_data.get("summary", {})
+    sessions = int(s.get("sessions", 0))
+    users = int(s.get("users", 0))
+    new_users = int(s.get("new_users", 0))
+    pageviews = int(s.get("pageviews", 0))
+    bounce_rate = s.get("bounce_rate", 0) * 100
+    avg_duration = s.get("avg_duration", 0)
+    avg_min = int(avg_duration // 60)
+    avg_sec = int(avg_duration % 60)
+
+    g1, g2, g3, g4, g5 = st.columns(5)
+    def ga4_card(col, label, value, sub=""):
+        col.markdown(f"""
+        <div class="card" style="border-left: 4px solid #e37400;">
+            <div class="metric-label">{label}</div>
+            <div class="metric-value" style="font-size:1.5rem;">{value}</div>
+            <div class="metric-delta" style="color:#888;">{sub}</div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    ga4_card(g1, "Sessions", f"{sessions:,}", f"{days}d total")
+    ga4_card(g2, "Active Users", f"{users:,}", f"{new_users:,} new")
+    ga4_card(g3, "Page Views", f"{pageviews:,}", f"{pageviews/sessions:.1f} pages/session" if sessions else "")
+    ga4_card(g4, "Bounce Rate", f"{bounce_rate:.1f}%", "lower = better")
+    ga4_card(g5, "Avg Duration", f"{avg_min}m {avg_sec}s", "per session")
+
+    # Daily sessions chart
+    daily_ga4 = ga4_data.get("daily", pd.DataFrame())
+    if not daily_ga4.empty:
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=daily_ga4["date"], y=daily_ga4["sessions"],
+            name="Sessions", marker_color="#e37400", opacity=0.8
+        ))
+        fig.add_trace(go.Scatter(
+            x=daily_ga4["date"], y=daily_ga4["users"],
+            name="Users", line=dict(color="#f9ab00", width=2), mode="lines+markers"
+        ))
+        fig.update_layout(
+            title="Daily Sessions & Users (GA4)",
+            legend=dict(orientation="h", y=1.1),
+            height=280, margin=dict(t=50, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    ch1, ch2 = st.columns(2)
+
+    # Traffic channels pie
+    channels = ga4_data.get("channels", [])
+    if channels:
+        with ch1:
+            ch_df = pd.DataFrame(channels).sort_values("sessions", ascending=False)
+            fig = px.pie(
+                ch_df, names="channel", values="sessions",
+                title="Traffic by Channel",
+                color_discrete_sequence=px.colors.qualitative.Set3
+            )
+            fig.update_layout(margin=dict(t=40, b=20), height=320)
+            st.plotly_chart(fig, use_container_width=True)
+
+    # Top pages
+    pages = ga4_data.get("pages", [])
+    if pages:
+        with ch2:
+            pages_df = pd.DataFrame(pages).head(10)
+            fig = px.bar(
+                pages_df, x="views", y="page", orientation="h",
+                title="Top Pages by Views",
+                labels={"views": "Page Views", "page": ""},
+                color="views", color_continuous_scale="Oranges"
+            )
+            fig.update_layout(height=320, margin=dict(t=40, b=20), yaxis=dict(autorange="reversed"))
+            st.plotly_chart(fig, use_container_width=True)
+
+elif ga4_data and "error" in ga4_data:
+    st.warning(f"GA4 error: {ga4_data['error']}")
+else:
+    st.info("Google Analytics 4 not connected. Add GA4_PROPERTY_ID and GA4_SERVICE_ACCOUNT_JSON to secrets.")
+
+# ââ TRENDS âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Trends")
 df_cur["date"] = df_cur["created_at"].dt.date
 daily_rev = df_cur.groupby("date")["total"].sum().reset_index()
 daily_ord = df_cur.groupby("date").size().reset_index(name="count")
+
 c1, c2 = st.columns(2)
 with c1:
-    fig = px.area(daily_rev, x="date", y="total", title="Daily Revenue", labels={"date": "", "total": f"Revenue ({cur})"}, color_discrete_sequence=["#6366f1"])
-    fig.update_layout(margin=dict(t=40, b=20), height=280)
-    st.plotly_chart(fig, use_container_width=True)
-with c2:
-    fig = px.bar(daily_ord, x="date", y="count", title="Daily Orders", labels={"date": "", "count": "Orders"}, color_discrete_sequence=["#22c55e"])
+    fig = px.area(daily_rev, x="date", y="total",
+                  title="Daily Revenue",
+                  labels={"date": "", "total": f"Revenue ({cur})"},
+                  color_discrete_sequence=["#6366f1"])
     fig.update_layout(margin=dict(t=40, b=20), height=280)
     st.plotly_chart(fig, use_container_width=True)
 
-st.markdown("### 🐟 Top Products")
+with c2:
+    fig = px.bar(daily_ord, x="date", y="count",
+                 title="Daily Orders",
+                 labels={"date": "", "count": "Orders"},
+                 color_discrete_sequence=["#22c55e"])
+    fig.update_layout(margin=dict(t=40, b=20), height=280)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ââ TOP PRODUCTS âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Top Products")
 rows = []
 for _, row in df_cur.iterrows():
     for li in row["line_items"]:
-        rows.append({"product": li["title"], "qty": li["qty"], "revenue": li["qty"]*li["price"]})
+        rows.append({"product": li["title"], "qty": li["qty"], "revenue": li["qty"] * li["price"]})
+
 if rows:
     prod_df = pd.DataFrame(rows).groupby("product").agg(qty=("qty","sum"), revenue=("revenue","sum")).reset_index()
     prod_df = prod_df.sort_values("revenue", ascending=False).head(15)
-    fig = px.bar(prod_df, x="revenue", y="product", orientation="h", title="Top 15 Products by Revenue", labels={"revenue": f"Revenue ({cur})", "product": ""}, color="revenue", color_continuous_scale="Blues")
+    fig = px.bar(prod_df, x="revenue", y="product", orientation="h",
+                 title="Top 15 Products by Revenue",
+                 labels={"revenue": f"Revenue ({cur})", "product": ""},
+                 color="revenue", color_continuous_scale="Blues")
     fig.update_layout(margin=dict(t=40, b=20), height=420, yaxis=dict(autorange="reversed"))
     st.plotly_chart(fig, use_container_width=True)
 
-st.markdown("### 📋 Order Status")
+# ââ STATUS âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð Order Status")
 s1, s2 = st.columns(2)
-with s1:
-    pc = df_cur["financial_status"].value_counts().reset_index(); pc.columns=["status","count"]
-    fig = px.pie(pc, names="status", values="count", title="Payment Status", color_discrete_sequence=px.colors.qualitative.Set3)
-    fig.update_layout(margin=dict(t=40, b=20), height=300); st.plotly_chart(fig, use_container_width=True)
-with s2:
-    fc = df_cur["fulfillment_status"].value_counts().reset_index(); fc.columns=["status","count"]
-    fig = px.pie(fc, names="status", values="count", title="Fulfillment Status", color_discrete_sequence=px.colors.qualitative.Pastel)
-    fig.update_layout(margin=dict(t=40, b=20), height=300); st.plotly_chart(fig, use_container_width=True)
 
-st.markdown("### 🧾 Recent Orders")
+with s1:
+    pay_counts = df_cur["financial_status"].value_counts().reset_index()
+    pay_counts.columns = ["status", "count"]
+    fig = px.pie(pay_counts, names="status", values="count", title="Payment Status",
+                 color_discrete_sequence=px.colors.qualitative.Set3)
+    fig.update_layout(margin=dict(t=40, b=20), height=300)
+    st.plotly_chart(fig, use_container_width=True)
+
+with s2:
+    ful_counts = df_cur["fulfillment_status"].value_counts().reset_index()
+    ful_counts.columns = ["status", "count"]
+    fig = px.pie(ful_counts, names="status", values="count", title="Fulfillment Status",
+                 color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(margin=dict(t=40, b=20), height=300)
+    st.plotly_chart(fig, use_container_width=True)
+
+# ââ RECENT ORDERS ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+st.markdown("### ð§¾ Recent Orders")
 recent = df_cur.sort_values("created_at", ascending=False).head(20).copy()
 recent["created_at"] = recent["created_at"].dt.tz_convert("Australia/Sydney").dt.strftime("%d %b %Y %H:%M")
-st.dataframe(recent[["name","created_at","total","financial_status","fulfillment_status"]].rename(columns={"name":"Order","created_at":"Date (AEST)","total":f"Total ({cur})","financial_status":"Payment","fulfillment_status":"Fulfillment"}), use_container_width=True, hide_index=True)
+st.dataframe(
+    recent[["name","created_at","total","financial_status","fulfillment_status"]].rename(columns={
+        "name": "Order",
+        "created_at": "Date (AEST)",
+        "total": f"Total ({cur})",
+        "financial_status": "Payment",
+        "fulfillment_status": "Fulfillment"
+    }),
+    use_container_width=True,
+    hide_index=True
+)
