@@ -3,46 +3,41 @@ import requests
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import json
 
-# —— PAGE CONFIG ————————————————————————————————
-st.set_page_config(
-    page_title="MAS Dashboard",
-    page_icon="🐟",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
-
-# —— CUSTOM CSS ————————————————————————————————
-st.markdown("""
-<style>
-  .block-container { padding: 1rem 2rem; max-width: 1400px; }
-  .card {
-    background: white; border-radius: 12px; padding: 16px 20px;
-    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
-    margin-bottom: 12px;
-  }
-  .metric-value { font-size: 2rem; font-weight: 700; color: #1a1a2e; }
-  .metric-label { font-size: 0.8rem; color: #666; text-transform: uppercase; letter-spacing: .05em; }
-  .metric-delta { font-size: 0.85rem; margin-top: 2px; }
-  .delta-up { color: #22c55e; }
-  .delta-down { color: #ef4444; }
-</style>
-""", unsafe_allow_html=True)
-
-# —— CREDENTIALS ————————————————————————————————
+# -- CONFIG --
 STORE = st.secrets.get("SHOPIFY_STORE", "")
 TOKEN = st.secrets.get("SHOPIFY_ACCESS_TOKEN", "")
 API_VER = "2024-10"
 GQL_URL = f"https://{STORE}/admin/api/{API_VER}/graphql.json"
 HEADERS = {"X-Shopify-Access-Token": TOKEN, "Content-Type": "application/json"}
 
-if not TOKEN:
-    st.error("⚠️ No SHOPIFY_ACCESS_TOKEN found in Streamlit secrets.")
-    st.stop()
+st.set_page_config(
+    page_title="MAS Dashboard",
+    page_icon="🐠",
+    layout="wide",
+    initial_sidebar_state="collapsed"
+)
 
-# —— DATA FETCHING ————————————————————————————————
+# -- CUSTOM CSS --
+st.markdown("""
+<style>
+.block-container { padding: 1rem 2rem; max-width: 1400px; }
+.card {
+    background: white; border-radius: 12px; padding: 16px 20px;
+    box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+    margin-bottom: 12px;
+}
+.metric-value { font-size: 2rem; font-weight: 700; color: #1a1a2e; }
+.metric-label { font-size: 0.8rem; color: #666; text-transform: uppercase; letter-spacing: .05em; }
+.metric-delta { font-size: 0.85rem; margin-top: 2px; }
+.delta-up { color: #22c55e; }
+.delta-down { color: #ef4444; }
+</style>
+""", unsafe_allow_html=True)
+
+# -- HELPERS --
 def gql(query, variables=None):
     payload = {"query": query}
     if variables:
@@ -51,25 +46,19 @@ def gql(query, variables=None):
     r.raise_for_status()
     data = r.json()
     if "errors" in data:
-        return None, data["errors"]
-    return data.get("data"), None
+        raise RuntimeError(data["errors"])
+    return data["data"]
 
 @st.cache_data(ttl=900)
 def fetch_orders(days=30):
-    """Fetch orders from the last N days using cursor-based pagination."""
-    since = (datetime.utcnow() - timedelta(days=days)).strftime("%Y-%m-%dT00:00:00Z")
-    orders = []
-    cursor = None
-    
-    QUERY = """
-    query GetOrders($cursor: String, $since: String!) {
-      orders(first: 250, after: $cursor, query: $since, sortKey: CREATED_AT) {
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    query = """
+    query($cursor: String, $query: String!) {
+      orders(first: 250, after: $cursor, query: $query, sortKey: CREATED_AT) {
+        pageInfo { hasNextPage endCursor }
         edges {
-          cursor
           node {
-            id
-            name
-            createdAt
+            id name createdAt
             totalPriceSet { shopMoney { amount currencyCode } }
             subtotalPriceSet { shopMoney { amount } }
             totalDiscountsSet { shopMoney { amount } }
@@ -78,218 +67,207 @@ def fetch_orders(days=30):
             lineItems(first: 50) {
               edges {
                 node {
-                  name
-                  quantity
+                  title quantity
                   originalUnitPriceSet { shopMoney { amount } }
                 }
               }
             }
           }
         }
-        pageInfo { hasNextPage }
       }
     }
     """
-    
+    orders = []
+    cursor = None
     while True:
-        variables = {"cursor": cursor, "since": f"created_at:>={since}"}
-        data, err = gql(QUERY, variables)
-        if err or not data:
-            break
+        data = gql(query, {"cursor": cursor, "query": f"created_at:>={since}"})
         edges = data["orders"]["edges"]
-        for edge in edges:
-            node = edge["node"]
+        for e in edges:
+            n = e["node"]
             orders.append({
-                "id": node["id"],
-                "name": node["name"],
-                "created_at": node["createdAt"],
-                "total": float(node["totalPriceSet"]["shopMoney"]["amount"]),
-                "subtotal": float(node["subtotalPriceSet"]["shopMoney"]["amount"]),
-                "discounts": float(node["totalDiscountsSet"]["shopMoney"]["amount"]),
-                "currency": node["totalPriceSet"]["shopMoney"]["currencyCode"],
-                "financial_status": node["displayFinancialStatus"],
-                "fulfillment_status": node["displayFulfillmentStatus"],
+                "id": n["id"],
+                "name": n["name"],
+                "created_at": pd.Timestamp(n["createdAt"]),
+                "total": float(n["totalPriceSet"]["shopMoney"]["amount"]),
+                "subtotal": float(n["subtotalPriceSet"]["shopMoney"]["amount"]),
+                "discounts": float(n["totalDiscountsSet"]["shopMoney"]["amount"]),
+                "currency": n["totalPriceSet"]["shopMoney"]["currencyCode"],
+                "financial_status": n["displayFinancialStatus"],
+                "fulfillment_status": n["displayFulfillmentStatus"],
                 "line_items": [
                     {
-                        "name": li["node"]["name"],
+                        "title": li["node"]["title"],
                         "qty": li["node"]["quantity"],
-                        "price": float(li["node"]["originalUnitPriceSet"]["shopMoney"]["amount"])
+                        "price": float(li["node"]["originalUnitPriceSet"]["shopMoney"]["amount"]),
                     }
-                    for li in node["lineItems"]["edges"]
-                ]
+                    for li in n["lineItems"]["edges"]
+                ],
             })
         if not data["orders"]["pageInfo"]["hasNextPage"]:
             break
-        cursor = edges[-1]["cursor"] if edges else None
-        if not cursor:
-            break
-    
+        cursor = data["orders"]["pageInfo"]["endCursor"]
     return orders
 
 @st.cache_data(ttl=900)
 def fetch_shop_info():
-    Q = """{ shop { name currencyCode email myshopifyDomain plan { displayName } } }"""
-    data, _ = gql(Q)
-    return data.get("shop", {}) if data else {}
+    data = gql("{ shop { name currencyCode } }")
+    return data["shop"]
 
-# —— HEADER ————————————————————————————————
-shop = fetch_shop_info()
-shop_name = shop.get("name", "Micro Aquatic Shop")
-currency = shop.get("currencyCode", "AUD")
-
-col_title, col_period = st.columns([3, 1])
-with col_title:
-    st.title(f"🐟 {shop_name} — Performance Dashboard")
-    st.caption(f"microaquaticshop.com.au · {currency} · {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-with col_period:
-    period = st.selectbox("", ["7 ngày qua", "30 ngày qua", "60 ngày qua", "90 ngày qua"],
-                          index=1, label_visibility="collapsed")
-
-days_map = {"7 ngày qua": 7, "30 ngày qua": 30, "60 ngày qua": 60, "90 ngày qua": 90}
-days = days_map[period]
-
-# —— LOAD DATA ————————————————————————————————
-with st.spinner("Đang tải dữ liệu từ Shopify..."):
-    orders = fetch_orders(days)
-    compare_orders = fetch_orders(days * 2)  # double period for comparison
-
-if not orders:
-    st.warning("Không có đơn hàng nào trong khoảng thời gian này.")
+# -- MAIN --
+if not STORE or not TOKEN:
+    st.error("Shopify credentials not configured. Add SHOPIFY_STORE and SHOPIFY_ACCESS_TOKEN to Streamlit secrets.")
     st.stop()
 
-# —— PROCESS DATA ————————————————————————————————
-df = pd.DataFrame(orders)
-df["created_at"] = pd.to_datetime(df["created_at"])
-df["date"] = df["created_at"].dt.date
-df["date"] = pd.to_datetime(df["date"])
+with st.sidebar:
+    st.title("Controls")
+    days = st.selectbox("Period", [7, 14, 30, 60, 90], index=2, format_func=lambda x: f"Last {x} days")
+    if st.button("Refresh data"):
+        st.cache_data.clear()
+        st.rerun()
 
-# Current period
-cutoff = datetime.utcnow() - timedelta(days=days)
+with st.spinner("Loading orders from Shopify..."):
+    try:
+        raw_orders = fetch_orders(days)
+        shop = fetch_shop_info()
+    except Exception as e:
+        st.error(f"Failed to load data: {e}")
+        st.stop()
+
+df = pd.DataFrame(raw_orders) if raw_orders else pd.DataFrame()
+
+st.title(f"MAS - {shop['name']} Sales Dashboard")
+st.caption(f"Currency: {shop['currencyCode']} - Last {days} days - {len(df)} orders - refreshes every 15 min")
+
+if df.empty:
+    st.info("No orders found for this period.")
+    st.stop()
+
+# Ensure timezone-aware timestamps
+df["created_at"] = pd.to_datetime(df["created_at"], utc=True)
+
+# Period comparison using timezone-aware timestamps
+cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days)
+prev_cutoff = pd.Timestamp.now(tz="UTC") - pd.Timedelta(days=days * 2)
+
 df_cur = df[df["created_at"] >= cutoff]
+df_prev = df[(df["created_at"] >= prev_cutoff) & (df["created_at"] < cutoff)]
 
-# Previous period
-prev_cutoff = datetime.utcnow() - timedelta(days=days * 2)
-df_all = pd.DataFrame(compare_orders)
-if not df_all.empty:
-    df_all["created_at"] = pd.to_datetime(df_all["created_at"])
-    df_prev = df_all[(df_all["created_at"] >= prev_cutoff) & (df_all["created_at"] < cutoff)]
-else:
-    df_prev = pd.DataFrame()
+def delta_pct(cur, prev):
+    if prev == 0:
+        return None
+    return (cur - prev) / prev * 100
 
-def pct_delta(cur, prev):
-    if prev == 0: return 0
-    return ((cur - prev) / prev) * 100
+def fmt_delta(pct):
+    if pct is None:
+        return ""
+    arrow = "up" if pct >= 0 else "down"
+    sign = "+" if pct >= 0 else ""
+    cls = "delta-up" if pct >= 0 else "delta-down"
+    return f'<span class="{cls}">{sign}{pct:.1f}%</span>'
 
-# KPIs
-total_rev = df_cur["total"].sum()
-prev_rev = df_prev["total"].sum() if not df_prev.empty else 0
-total_orders = len(df_cur)
-prev_orders = len(df_prev)
-aov = total_rev / total_orders if total_orders else 0
-prev_aov = prev_rev / prev_orders if prev_orders else 0
-total_discounts = df_cur["discounts"].sum()
+# KPI calculations
+revenue_cur = df_cur["total"].sum()
+revenue_prev = df_prev["total"].sum()
+orders_cur = len(df_cur)
+orders_prev = len(df_prev)
+aov_cur = revenue_cur / orders_cur if orders_cur else 0
+aov_prev = revenue_prev / orders_prev if orders_prev else 0
+discounts_cur = df_cur["discounts"].sum()
+discounts_prev = df_prev["discounts"].sum()
+cur = df_cur["currency"].iloc[0] if not df_cur.empty else "AUD"
 
-# —— KPI CARDS ————————————————————————————————
-st.markdown("---")
+# -- KPI CARDS --
+st.markdown("### Key Metrics")
 k1, k2, k3, k4 = st.columns(4)
 
-def kpi_card(col, label, value, delta_pct, prefix="$", suffix=""):
-    arrow = "▲" if delta_pct >= 0 else "▼"
-    cls = "delta-up" if delta_pct >= 0 else "delta-down"
+def kpi_card(col, label, value, pct):
     col.markdown(f"""
     <div class="card">
-      <div class="metric-label">{label}</div>
-      <div class="metric-value">{prefix}{value:,.0f}{suffix}</div>
-      <div class="metric-delta {cls}">{arrow} {abs(delta_pct):.1f}% vs kỳ trước</div>
+        <div class="metric-label">{label}</div>
+        <div class="metric-value">{value}</div>
+        <div class="metric-delta">{fmt_delta(pct)}</div>
     </div>
     """, unsafe_allow_html=True)
 
-kpi_card(k1, "Doanh Thu", total_rev, pct_delta(total_rev, prev_rev), f"{currency} ")
-kpi_card(k2, "Đơn Hàng", total_orders, pct_delta(total_orders, prev_orders), "")
-kpi_card(k3, "AOV (Giá trị TB)", aov, pct_delta(aov, prev_aov), f"{currency} ")
-kpi_card(k4, "Tổng Giảm Giá", total_discounts, 0, f"{currency} ")
+kpi_card(k1, "Revenue", f"{cur} {revenue_cur:,.2f}", delta_pct(revenue_cur, revenue_prev))
+kpi_card(k2, "Orders", f"{orders_cur:,}", delta_pct(orders_cur, orders_prev))
+kpi_card(k3, "Avg Order Value", f"{cur} {aov_cur:,.2f}", delta_pct(aov_cur, aov_prev))
+kpi_card(k4, "Discounts Given", f"{cur} {discounts_cur:,.2f}", delta_pct(discounts_cur, discounts_prev))
 
-# —— REVENUE CHART ————————————————————————————————
-st.markdown("#### 📈 Doanh Thu Theo Ngày")
-daily = df_cur.groupby("date")["total"].sum().reset_index()
-daily.columns = ["Ngày", "Doanh thu"]
-fig_rev = px.area(daily, x="Ngày", y="Doanh thu",
-                  color_discrete_sequence=["#6366f1"],
-                  labels={"Doanh thu": f"Doanh thu ({currency})"},
-                  template="plotly_white")
-fig_rev.update_traces(fill="tozeroy", fillcolor="rgba(99,102,241,0.1)")
-fig_rev.update_layout(height=300, margin=dict(l=0, r=0, t=20, b=0))
-st.plotly_chart(fig_rev, use_container_width=True)
+# -- CHARTS --
+st.markdown("### Trends")
+df_cur["date"] = df_cur["created_at"].dt.date
+daily_rev = df_cur.groupby("date")["total"].sum().reset_index()
+daily_ord = df_cur.groupby("date").size().reset_index(name="count")
 
-# —— ORDERS & TOP PRODUCTS ————————————————————————————————
-col_l, col_r = st.columns(2)
+c1, c2 = st.columns(2)
+with c1:
+    fig = px.area(daily_rev, x="date", y="total",
+                  title="Daily Revenue",
+                  labels={"date": "", "total": f"Revenue ({cur})"},
+                  color_discrete_sequence=["#6366f1"])
+    fig.update_layout(margin=dict(t=40, b=20), height=280)
+    st.plotly_chart(fig, use_container_width=True)
 
-with col_l:
-    st.markdown("#### 📦 Đơn Hàng Theo Ngày")
-    daily_orders = df_cur.groupby("date")["id"].count().reset_index()
-    daily_orders.columns = ["Ngày", "Số đơn"]
-    fig_ord = px.bar(daily_orders, x="Ngày", y="Số đơn",
-                     color_discrete_sequence=["#f59e0b"],
-                     template="plotly_white")
-    fig_ord.update_layout(height=280, margin=dict(l=0, r=0, t=20, b=0))
-    st.plotly_chart(fig_ord, use_container_width=True)
+with c2:
+    fig = px.bar(daily_ord, x="date", y="count",
+                 title="Daily Orders",
+                 labels={"date": "", "count": "Orders"},
+                 color_discrete_sequence=["#22c55e"])
+    fig.update_layout(margin=dict(t=40, b=20), height=280)
+    st.plotly_chart(fig, use_container_width=True)
 
-with col_r:
-    st.markdown("#### 🏆 Top Sản Phẩm")
-    all_items = []
-    for _, row in df_cur.iterrows():
-        for item in row["line_items"]:
-            all_items.append({
-                "product": item["name"],
-                "qty": item["qty"],
-                "revenue": item["qty"] * item["price"]
-            })
-    if all_items:
-        items_df = pd.DataFrame(all_items)
-        top_products = items_df.groupby("product").agg(
-            qty=("qty", "sum"), revenue=("revenue", "sum")
-        ).sort_values("revenue", ascending=False).head(10).reset_index()
-        fig_top = px.bar(top_products, x="revenue", y="product",
-                         orientation="h",
-                         color_discrete_sequence=["#10b981"],
-                         labels={"revenue": f"Doanh thu ({currency})", "product": ""},
-                         template="plotly_white")
-        fig_top.update_layout(height=280, margin=dict(l=0, r=0, t=20, b=0),
-                               yaxis={"categoryorder": "total ascending"})
-        st.plotly_chart(fig_top, use_container_width=True)
-    else:
-        st.info("Không có dữ liệu sản phẩm")
+# -- TOP PRODUCTS --
+st.markdown("### Top Products")
+rows = []
+for _, row in df_cur.iterrows():
+    for li in row["line_items"]:
+        rows.append({"product": li["title"], "qty": li["qty"], "revenue": li["qty"] * li["price"]})
 
-# —— ORDER STATUS ————————————————————————————————
-col_s1, col_s2 = st.columns(2)
+if rows:
+    prod_df = pd.DataFrame(rows).groupby("product").agg(qty=("qty","sum"), revenue=("revenue","sum")).reset_index()
+    prod_df = prod_df.sort_values("revenue", ascending=False).head(15)
+    fig = px.bar(prod_df, x="revenue", y="product", orientation="h",
+                 title="Top 15 Products by Revenue",
+                 labels={"revenue": f"Revenue ({cur})", "product": ""},
+                 color="revenue", color_continuous_scale="Blues")
+    fig.update_layout(margin=dict(t=40, b=20), height=420, yaxis=dict(autorange="reversed"))
+    st.plotly_chart(fig, use_container_width=True)
+else:
+    st.info("No line item data available.")
 
-with col_s1:
-    st.markdown("#### 💳 Trạng Thái Thanh Toán")
-    fin_status = df_cur["financial_status"].value_counts().reset_index()
-    fin_status.columns = ["Trạng thái", "Số đơn"]
-    fig_fin = px.pie(fin_status, names="Trạng thái", values="Số đơn",
-                     color_discrete_sequence=px.colors.qualitative.Set2,
-                     template="plotly_white")
-    fig_fin.update_layout(height=260, margin=dict(l=0, r=0, t=20, b=0))
-    st.plotly_chart(fig_fin, use_container_width=True)
+# -- STATUS CHARTS --
+st.markdown("### Order Status")
+s1, s2 = st.columns(2)
 
-with col_s2:
-    st.markdown("#### 🚚 Trạng Thái Giao Hàng")
-    ful_status = df_cur["fulfillment_status"].value_counts().reset_index()
-    ful_status.columns = ["Trạng thái", "Số đơn"]
-    fig_ful = px.pie(ful_status, names="Trạng thái", values="Số đơn",
-                     color_discrete_sequence=px.colors.qualitative.Pastel,
-                     template="plotly_white")
-    fig_ful.update_layout(height=260, margin=dict(l=0, r=0, t=20, b=0))
-    st.plotly_chart(fig_ful, use_container_width=True)
+with s1:
+    pay_counts = df_cur["financial_status"].value_counts().reset_index()
+    pay_counts.columns = ["status", "count"]
+    fig = px.pie(pay_counts, names="status", values="count", title="Payment Status",
+                 color_discrete_sequence=px.colors.qualitative.Set3)
+    fig.update_layout(margin=dict(t=40, b=20), height=300)
+    st.plotly_chart(fig, use_container_width=True)
 
-# —— RECENT ORDERS ————————————————————————————————
-st.markdown("#### 🧾 Đơn Hàng Gần Nhất")
-recent = df_cur.sort_values("created_at", ascending=False).head(20)[[
-    "name", "created_at", "total", "financial_status", "fulfillment_status"
-]].copy()
-recent["created_at"] = recent["created_at"].dt.strftime("%d/%m/%Y %H:%M")
-recent.columns = ["Mã đơn", "Ngày tạo", f"Tổng ({currency})", "Thanh toán", "Giao hàng"]
-st.dataframe(recent, use_container_width=True, hide_index=True)
+with s2:
+    ful_counts = df_cur["fulfillment_status"].value_counts().reset_index()
+    ful_counts.columns = ["status", "count"]
+    fig = px.pie(ful_counts, names="status", values="count", title="Fulfillment Status",
+                 color_discrete_sequence=px.colors.qualitative.Pastel)
+    fig.update_layout(margin=dict(t=40, b=20), height=300)
+    st.plotly_chart(fig, use_container_width=True)
 
-st.caption("🔄 Dữ liệu cache 15 phút · Nguồn: Shopify Admin API · MAS Dashboard v2")
+# -- RECENT ORDERS --
+st.markdown("### Recent Orders")
+recent = df_cur.sort_values("created_at", ascending=False).head(20).copy()
+recent["created_at"] = recent["created_at"].dt.tz_convert("Australia/Sydney").dt.strftime("%d %b %Y %H:%M")
+st.dataframe(
+    recent[["name","created_at","total","financial_status","fulfillment_status"]].rename(columns={
+        "name": "Order",
+        "created_at": "Date (AEST)",
+        "total": f"Total ({cur})",
+        "financial_status": "Payment",
+        "fulfillment_status": "Fulfillment"
+    }),
+    use_container_width=True,
+    hide_index=True
+)
